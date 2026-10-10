@@ -1,0 +1,16 @@
+[workspace]
+name = "azo-plugin-buffer-expansion"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+# Runtime dependencies come from the Agent Zoo host.
+[tool.agent-zoo.plugin]
+name = "azo-plugin-buffer-expansion"
+default = ["src/buffer_expansion.py"]
+
+[tool.agent-zoo.plugin.config]
+files = ["config/buffer_expansion.json", "skills/buffer-expansion/SKILL.md"]
+
+[tasks]
+test = "bash scripts/test.sh"
