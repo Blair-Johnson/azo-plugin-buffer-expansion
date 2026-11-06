@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
+import tempfile
 from pathlib import Path
 
 from agent_utils import Feature
@@ -12,6 +15,7 @@ from agent_utils.components import (
 )
 from agent_utils.skills import SkillSource
 from agent_zoo.projects import resolve_state_root
+from agent_zoo.runtime.settings import Setting, SettingError
 from agents.system_prompt import SystemPromptSkillList
 
 PLUGIN = "azo-plugin-buffer-expansion"
@@ -28,15 +32,49 @@ def resource_path(relative: str) -> Path:
     return installed if installed.is_file() else Path(__file__).resolve().parent.parent / relative
 
 
-def load_limit() -> int | None:
-    path = resource_path("config/buffer_expansion.json")
+def _load_settings(path: Path) -> dict:
     settings = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(settings, dict) or settings.keys() - {"max_characters"}:
         raise ValueError(f"{path}: expected an object containing only max_characters")
     limit = settings.get("max_characters", DEFAULT_MAX_CHARACTERS)
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError(f"{path}: max_characters must be a positive integer or null")
-    return limit
+    return settings
+
+
+def load_limit() -> int | None:
+    return _load_settings(resource_path("config/buffer_expansion.json")).get(
+        "max_characters", DEFAULT_MAX_CHARACTERS)
+
+
+def get_limit_setting(ctx) -> int:
+    try:
+        limit = load_limit()
+    except (OSError, ValueError):
+        raise SettingError("Cannot read buffer expansion configuration.") from None
+    return 0 if limit is None else limit
+
+
+def set_limit_setting(ctx, value: int) -> None:
+    if type(value) is not int or not 0 <= value <= 2**63 - 1:
+        raise SettingError("Character limit must be a nonnegative signed 64-bit integer.")
+    temporary = None
+    try:
+        path = resource_path("config/buffer_expansion.json").resolve(strict=True)
+        settings = _load_settings(path)
+        settings["max_characters"] = None if value == 0 else value
+        mode = stat.S_IMODE(path.stat().st_mode)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".buffer-expansion-", delete=False) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), mode)
+            stream.write(json.dumps(settings, indent=2) + "\n")
+        os.replace(temporary, path)
+    except (OSError, ValueError):
+        raise SettingError("Cannot save buffer expansion configuration.") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def digest(text: str) -> str:
@@ -168,6 +206,15 @@ class BufferExpansionSkill(RenderTransformRegistrar):
 
 
 def register_features(builder, *, session, config):
+    builder.add(Feature(
+        name=PLUGIN + "-settings",
+        components=[Setting(
+            "buffer_expansion.max_characters", "Character limit", "int",
+            get_limit_setting, set_limit_setting, group="Buffer expansion",
+            min=0, max=2**63 - 1, apply="reload",
+            help="Configured characters per message; 0 means unlimited. Reload to apply to new snapshots.",
+        )], order=[Setting],
+    ))
     builder.add(Feature(
         name=PLUGIN,
         components=[BufferRenderPlanInitializer(), BufferSnapshotRecorder(load_limit()),
