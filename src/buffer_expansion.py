@@ -29,7 +29,7 @@ LIMIT_NOTICE = "[buffer expansion omitted: character limit]"
 
 def resource_path(relative: str) -> Path:
     installed = Path(resolve_state_root()) / "plugin-configs" / PLUGIN / relative
-    return installed if installed.is_file() else Path(__file__).resolve().parent.parent / relative
+    return installed if installed.exists() or installed.is_symlink() else Path(__file__).resolve().parent.parent / relative
 
 
 def _load_settings(path: Path) -> dict:
@@ -60,10 +60,14 @@ def set_limit_setting(ctx, value: int) -> None:
         raise SettingError("Character limit must be a nonnegative signed 64-bit integer.")
     temporary = None
     try:
-        path = resource_path("config/buffer_expansion.json").resolve(strict=True)
-        settings = _load_settings(path)
+        relative = "config/buffer_expansion.json"
+        path = Path(resolve_state_root()) / "plugin-configs" / PLUGIN / relative
+        if path.exists() or path.is_symlink():
+            path = path.resolve(strict=True)
+        settings = _load_settings(path if path.exists() else resource_path(relative))
         settings["max_characters"] = None if value == 0 else value
-        mode = stat.S_IMODE(path.stat().st_mode)
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=".buffer-expansion-", delete=False) as stream:
             temporary = Path(stream.name)

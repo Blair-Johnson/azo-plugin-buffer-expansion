@@ -99,3 +99,28 @@ def test_failed_atomic_replace_preserves_file(settings, monkeypatch):
     assert "private path" not in json.dumps(result)
     assert path.read_text() == "{}\n"
     assert list(path.parent.iterdir()) == [path]
+
+
+def test_first_save_creates_user_copy_without_editing_bundle(settings):
+    path, session, _, registry = settings
+    path.unlink()
+    source = plugin.resource_path("config/buffer_expansion.json")
+    original = source.read_bytes()
+    assert registry.catalog(SettingsContext(session))[0]["value"] == 12000
+    assert not path.exists()
+    assert edit(registry, session, 321)["ok"]
+    assert json.loads(path.read_text()) == {"max_characters": 321}
+    assert source.read_bytes() == original
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("broken", ["directory", "symlink"])
+def test_invalid_destination_does_not_fall_back_to_bundle(settings, broken):
+    path, session, _, registry = settings
+    path.unlink()
+    if broken == "directory":
+        path.mkdir()
+    else:
+        path.symlink_to(path.parent / "missing.json")
+    assert not edit(registry, session, 321)["ok"]
+    assert path.is_dir() if broken == "directory" else path.is_symlink()
