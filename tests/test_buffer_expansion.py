@@ -4,14 +4,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agent_utils import Entry
-from agent_utils.components import RenderPlanInitializer, RenderPlanFinalizer
-from agent_utils.files.buffer_manager import BufferManager
+from agent_utils.core.events import RenderRequested
+from agent_utils.core.state import Entry
+from agent_utils.features.buffers.manager import BufferManager
+from agent_utils.features.core import RenderPlanFinalizer, RenderPlanInitializer
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("buffer_expansion", ROOT / "src/buffer_expansion.py")
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
+
+
+def _noop(_event):
+    return None
 
 
 def setup(text="one\ntwo\nthree\n", template="{{buffer://ID}}", role="assistant"):
@@ -23,10 +28,11 @@ def setup(text="one\ntwo\nthree\n", template="{{buffer://ID}}", role="assistant"
 
 
 def prepare(state, limit=12000):
-    plugin.BufferSnapshotRecorder(limit)(state)
-    RenderPlanInitializer(("model", "user"))(state)
-    plugin.BufferExpansionRenderer()(state)
-    RenderPlanFinalizer()(state)
+    event = RenderRequested()
+    plugin.BufferSnapshotRecorder(limit).handle(event, state, _noop)
+    RenderPlanInitializer(("model", "user")).handle(event, state, _noop)
+    plugin.BufferExpansionRenderer().handle(event, state, _noop)
+    RenderPlanFinalizer().handle(event, state, _noop)
     return state.entries[0].render(state, channel="user")[0]["content"]
 
 
@@ -37,7 +43,10 @@ def test_whole_buffer_and_model_isolation():
     assert state.entries[0].messages[0]["content"] == source
 
 
-@pytest.mark.parametrize("selector,expected", [(":2:3", "two\nthree\n"), (":1:1", "one\n"), ("", "one\ntwo\nthree\n")])
+@pytest.mark.parametrize(
+    "selector,expected",
+    [(":2:3", "two\nthree\n"), (":1:1", "one\n"), ("", "one\ntwo\nthree\n")],
+)
 def test_ranges(selector, expected):
     state, _, _ = setup(template="{{buffer://ID" + selector + "}}")
     assert prepare(state) == expected
@@ -69,7 +78,9 @@ def test_missing_buffer_is_frozen():
     assert prepare(state) == original
 
 
-@pytest.mark.parametrize("selector", [":0:1", ":3:2", ":1:99", ":1", ":-1:2", ":x:2", ":1:2:3"])
+@pytest.mark.parametrize(
+    "selector", [":0:1", ":3:2", ":1:99", ":1", ":-1:2", ":x:2", ":1:2:3"]
+)
 def test_invalid_range_is_visible_not_fatal(selector):
     state, _, _ = setup(template="{{buffer://ID" + selector + "}}")
     assert "unavailable" in prepare(state)
@@ -85,7 +96,9 @@ def test_limit_and_disabled_limit():
 def test_shared_budget_includes_notices():
     state, _, _ = setup("x" * 60, "{{buffer://ID}} {{buffer://ID}} {{buffer://ID}}")
     rendered = prepare(state, limit=100)
-    replacements = state.entries[0].metadata[plugin.METADATA_KEY]["messages"]["0"]["replacements"]
+    replacements = state.entries[0].metadata[plugin.METADATA_KEY]["messages"]["0"][
+        "replacements"
+    ]
     assert sum(len(item["text"]) for item in replacements) <= 100
     assert len(rendered) <= 102
     assert rendered.startswith("x" * 60)
@@ -115,7 +128,13 @@ def test_escape_and_no_recursive_expansion():
 
 def test_repeated_render_and_multiple_entries():
     state, _, source = setup("hello")
-    state.entries.append(Entry(messages=[{"role": "assistant", "content": "other " + source}], index=1, step=1))
+    state.entries.append(
+        Entry(
+            messages=[{"role": "assistant", "content": "other " + source}],
+            index=1,
+            step=1,
+        )
+    )
     for _ in range(3):
         assert prepare(state) == "hello"
         assert state.entries[1].render(state, channel="user")[0]["content"] == "other hello"
@@ -144,7 +163,19 @@ def test_valid_config(tmp_path, monkeypatch, limit):
     assert plugin.load_limit() == limit
 
 
-@pytest.mark.parametrize("settings", [{"max_characters": 0}, {"max_characters": -1}, {"max_characters": True}, {"max_characters": "off"}, {"max_characters": 1.5}, {"typo": 12}, [], None])
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"max_characters": 0},
+        {"max_characters": -1},
+        {"max_characters": True},
+        {"max_characters": "off"},
+        {"max_characters": 1.5},
+        {"typo": 12},
+        [],
+        None,
+    ],
+)
 def test_invalid_config(tmp_path, monkeypatch, settings):
     config = tmp_path / "config.json"
     config.write_text(json.dumps(settings))
