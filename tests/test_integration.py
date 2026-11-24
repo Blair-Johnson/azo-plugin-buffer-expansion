@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 
+from agent_utils.core.events import SessionStarted
 from agent_utils.core.session import Session
 from agent_utils.core.state import Entry
 from agent_utils.features.core import RenderPlanInitializer
@@ -74,6 +75,7 @@ def test_native_loader_discovers_plugin_and_skill(tmp_path, monkeypatch):
         plugin_loader, "_apply_entry_point_plugins", lambda *args, **kwargs: None
     )
     session, pipeline = build(monkeypatch, native=True)
+    session.step(SessionStarted())
     session.render()
     assert session.state.skill_registry.get("buffer-expansion") is not None
     assert any(
