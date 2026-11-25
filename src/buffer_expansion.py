@@ -8,16 +8,20 @@ import re
 from pathlib import Path
 from typing import Any
 
-from agent_utils.core.events import Event, RenderRequested, SessionRestored, SessionStarted
+from agent_utils.core.events import Event, RenderRequested
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.features.core import (
     RenderTransformRegistrar,
     SafeRenderMetadataRecorder,
 )
-from agent_utils.features.skills import SkillSource
 from agent_zoo.core.render_channels import USER_RENDER_CHANNEL
-from agent_zoo.durability import PluginStorage, StoreUpdate
+from agent_zoo.durability import (
+    BundledSkillRegistrar,
+    PluginConfigBox,
+    PluginStorage,
+    preload_bundled_skill,
+)
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.system_prompt import SystemPromptSkillList
 
@@ -64,27 +68,18 @@ def load_limit() -> int | None:
     )
 
 
-class _SettingsBox:
-    """In-memory snapshot of plugin config loaded at build time; persisted via PluginStoreDriver."""
-
-    def __init__(self, settings: dict[str, Any] | None = None, load_error: bool = False) -> None:
-        self.settings = settings
-        self.load_error = load_error
-
-
-def _load_settings_box() -> _SettingsBox:
-    try:
-        return _SettingsBox(settings=_load_settings(resource_path(CONFIG_RELATIVE)))
-    except (OSError, ValueError):
-        return _SettingsBox(settings=None, load_error=True)
+def _load_settings_box() -> PluginConfigBox:
+    return PluginConfigBox(
+        PLUGIN,
+        config_filename=CONFIG_RELATIVE,
+        validate=_validate_settings_dict,
+    )
 
 
-def _make_limit_callbacks(box: _SettingsBox):
+def _make_limit_callbacks(box: PluginConfigBox):
     def get_limit_setting(ctx: Any) -> int:
         del ctx
-        if box.load_error or box.settings is None:
-            raise SettingError("Cannot read buffer expansion configuration.")
-        limit = box.settings.get("max_characters", DEFAULT_MAX_CHARACTERS)
+        limit = box.require_loaded().get("max_characters", DEFAULT_MAX_CHARACTERS)
         return 0 if limit is None else limit
 
     def set_limit_setting(ctx: Any, value: int) -> None:
@@ -92,28 +87,10 @@ def _make_limit_callbacks(box: _SettingsBox):
             raise SettingError(
                 "Character limit must be a nonnegative signed 64-bit integer."
             )
-        if box.load_error or box.settings is None:
-            raise SettingError("Cannot save buffer expansion configuration.")
-        previous = dict(box.settings)
-        updated = dict(box.settings)
-        updated["max_characters"] = None if value == 0 else value
-        box.settings = updated
-
-        def _rollback() -> None:
-            box.settings = previous
-
-        req = StoreUpdate(
-            plugin=PLUGIN,
-            scope="config",
-            config_filename=CONFIG_RELATIVE,
-            value=updated,
+        box.mutate(
+            ctx,
+            lambda doc: {**doc, "max_characters": None if value == 0 else value},
         )
-        submit_persist = getattr(ctx, "submit_persist_io", None)
-        if callable(submit_persist) and getattr(ctx, "state", None) is not None:
-            submit_persist(req, rollback=_rollback)
-        else:
-            box.settings = previous
-            raise SettingError("Cannot save buffer expansion configuration without session IO.")
 
     return get_limit_setting, set_limit_setting
 
@@ -245,60 +222,20 @@ class BufferExpansionRenderer(RenderTransformRegistrar):
             entry.append_render_transform(USER_CHANNEL, expand, name=PLUGIN)
 
 
-class _SkillRuntime:
-    def __init__(self, registered_registry_id: int | None = None) -> None:
-        self.registered_registry_id = registered_registry_id
-
-
-class BufferExpansionSkill(RenderTransformRegistrar):
-    handles = (SessionStarted, SessionRestored, RenderRequested)
-    optional_reads = {"skill_registry"}
-    writes = {"skill_registry"}
-
-    def __init__(self, skill_path: Path | None = None) -> None:
-        self.skill_path = skill_path or resource_path("skills/buffer-expansion/SKILL.md")
-        try:
-            self.skill_text: str | None = self.skill_path.read_text(encoding="utf-8")
-        except OSError:
-            self.skill_text = None
-
-    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
-        del event, emit
-        registry = getattr(state, "skill_registry", None)
-        if registry is None:
-            return
-        runtime_fn = getattr(state, "runtime", None)
-        rt = runtime_fn("buffer_expansion_skill", _SkillRuntime) if callable(runtime_fn) else None
-        reg_id = id(registry)
-        if rt is not None and rt.registered_registry_id == reg_id:
-            return
-        source = SkillSource(
-            path=str(self.skill_path.parent),
-            kind=PLUGIN,
-            scope="bundled",
-            precedence=-5000,
-            native=True,
-            always_list=True,
-        )
-        registry.add_sources((source,))
-        if self.skill_text is not None:
-            registry.register_skill_text(
-                str(self.skill_path),
-                self.skill_text,
-                source=source,
-            )
-        if rt is not None:
-            rt.registered_registry_id = reg_id
-
-
 def register_features(builder: Any, *, config: Any) -> None:
     del config
     box = _load_settings_box()
     get_limit, set_limit = _make_limit_callbacks(box)
     initial_limit = (
-        box.settings.get("max_characters", DEFAULT_MAX_CHARACTERS)
-        if box.settings is not None
+        box.data.get("max_characters", DEFAULT_MAX_CHARACTERS)
+        if box.load_error is None
         else DEFAULT_MAX_CHARACTERS
+    )
+    skill_dir = resource_path("skills/buffer-expansion/SKILL.md").parent
+    skill_registrar = BundledSkillRegistrar(
+        preloaded=preload_bundled_skill(skill_dir, kind=PLUGIN),
+        skill_name="buffer-expansion",
+        runtime_key="buffer_expansion_skill",
     )
     builder.add(
         Feature(
@@ -329,12 +266,12 @@ def register_features(builder: Any, *, config: Any) -> None:
             components=[
                 BufferSnapshotRecorder(initial_limit),
                 BufferExpansionRenderer(),
-                BufferExpansionSkill(),
+                skill_registrar,
             ],
             order=[
                 BufferSnapshotRecorder,
                 BufferExpansionRenderer,
-                BufferExpansionSkill,
+                BundledSkillRegistrar,
                 SystemPromptSkillList,
             ],
         )
