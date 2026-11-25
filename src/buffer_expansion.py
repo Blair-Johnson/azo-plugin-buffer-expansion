@@ -4,37 +4,39 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import stat
-import tempfile
 from pathlib import Path
 from typing import Any
 
-from agent_utils.core.events import Event, RenderRequested
+from agent_utils.core.events import Event, RenderRequested, SessionRestored, SessionStarted
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_utils.features.core import (
-    RenderPlanInitializer,
     RenderTransformRegistrar,
     SafeRenderMetadataRecorder,
 )
 from agent_utils.features.skills import SkillSource
+from agent_zoo.durability import PluginStorage, StoreUpdate
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.system_prompt import SystemPromptSkillList
-from agent_zoo.storage.projects import resolve_state_root
+from agent_zoo.transport.render_channels import USER_RENDER_CHANNEL
 
 PLUGIN = "azo-plugin-buffer-expansion"
 METADATA_KEY = "azo_plugin_buffer_expansion_v1"
-USER_CHANNEL = "user"
+USER_CHANNEL = USER_RENDER_CHANNEL
+CONFIG_RELATIVE = "config/buffer_expansion.json"
 DEFAULT_MAX_CHARACTERS = 12_000
 REFERENCE = re.compile(r"(?<!\\)\{\{buffer://([^{}\n]*)\}\}")
 SELECTOR = re.compile(r"([A-Za-z0-9_.-]+)(?::([0-9]+):([0-9]+))?\Z")
 LIMIT_NOTICE = "[buffer expansion omitted: character limit]"
 
 
+def _plugin_storage() -> PluginStorage:
+    return PluginStorage(PLUGIN, config_filename=CONFIG_RELATIVE)
+
+
 def resource_path(relative: str) -> Path:
-    installed = Path(resolve_state_root()) / "plugin-configs" / PLUGIN / relative
+    installed = _plugin_storage().config_dir / relative
     return (
         installed
         if installed.exists() or installed.is_symlink()
@@ -42,63 +44,78 @@ def resource_path(relative: str) -> Path:
     )
 
 
-def _load_settings(path: Path) -> dict[str, Any]:
-    settings = json.loads(path.read_text(encoding="utf-8"))
+def _validate_settings_dict(settings: Any, *, source: str = CONFIG_RELATIVE) -> dict[str, Any]:
     if not isinstance(settings, dict) or settings.keys() - {"max_characters"}:
-        raise ValueError(f"{path}: expected an object containing only max_characters")
+        raise ValueError(f"{source}: expected an object containing only max_characters")
     limit = settings.get("max_characters", DEFAULT_MAX_CHARACTERS)
     if limit is not None and (type(limit) is not int or limit < 1):
-        raise ValueError(f"{path}: max_characters must be a positive integer or null")
-    return settings
+        raise ValueError(f"{source}: max_characters must be a positive integer or null")
+    return dict(settings)
+
+
+def _load_settings(path: Path) -> dict[str, Any]:
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    return _validate_settings_dict(settings, source=str(path))
 
 
 def load_limit() -> int | None:
-    return _load_settings(resource_path("config/buffer_expansion.json")).get(
+    return _load_settings(resource_path(CONFIG_RELATIVE)).get(
         "max_characters", DEFAULT_MAX_CHARACTERS
     )
 
 
-def get_limit_setting(ctx: Any) -> int:
-    del ctx
+class _SettingsBox:
+    """In-memory snapshot of plugin config loaded at build time; persisted via PluginStoreDriver."""
+
+    def __init__(self, settings: dict[str, Any] | None = None, load_error: bool = False) -> None:
+        self.settings = settings
+        self.load_error = load_error
+
+
+def _load_settings_box() -> _SettingsBox:
     try:
-        limit = load_limit()
+        return _SettingsBox(settings=_load_settings(resource_path(CONFIG_RELATIVE)))
     except (OSError, ValueError):
-        raise SettingError("Cannot read buffer expansion configuration.") from None
-    return 0 if limit is None else limit
+        return _SettingsBox(settings=None, load_error=True)
 
 
-def set_limit_setting(ctx: Any, value: int) -> None:
-    del ctx
-    if type(value) is not int or not 0 <= value <= 2**63 - 1:
-        raise SettingError(
-            "Character limit must be a nonnegative signed 64-bit integer."
+def _make_limit_callbacks(box: _SettingsBox):
+    def get_limit_setting(ctx: Any) -> int:
+        del ctx
+        if box.load_error or box.settings is None:
+            raise SettingError("Cannot read buffer expansion configuration.")
+        limit = box.settings.get("max_characters", DEFAULT_MAX_CHARACTERS)
+        return 0 if limit is None else limit
+
+    def set_limit_setting(ctx: Any, value: int) -> None:
+        if type(value) is not int or not 0 <= value <= 2**63 - 1:
+            raise SettingError(
+                "Character limit must be a nonnegative signed 64-bit integer."
+            )
+        if box.load_error or box.settings is None:
+            raise SettingError("Cannot save buffer expansion configuration.")
+        previous = dict(box.settings)
+        updated = dict(box.settings)
+        updated["max_characters"] = None if value == 0 else value
+        box.settings = updated
+
+        def _rollback() -> None:
+            box.settings = previous
+
+        req = StoreUpdate(
+            plugin=PLUGIN,
+            scope="config",
+            config_filename=CONFIG_RELATIVE,
+            value=updated,
         )
-    temporary = None
-    try:
-        relative = "config/buffer_expansion.json"
-        path = Path(resolve_state_root()) / "plugin-configs" / PLUGIN / relative
-        if path.exists() or path.is_symlink():
-            path = path.resolve(strict=True)
-        settings = _load_settings(path if path.exists() else resource_path(relative))
-        settings["max_characters"] = None if value == 0 else value
-        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=".buffer-expansion-",
-            delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
-            os.fchmod(stream.fileno(), mode)
-            stream.write(json.dumps(settings, indent=2) + "\n")
-        os.replace(temporary, path)
-    except (OSError, ValueError):
-        raise SettingError("Cannot save buffer expansion configuration.") from None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        submit_persist = getattr(ctx, "submit_persist_io", None)
+        if callable(submit_persist) and getattr(ctx, "state", None) is not None:
+            submit_persist(req, rollback=_rollback)
+        else:
+            box.settings = previous
+            raise SettingError("Cannot save buffer expansion configuration without session IO.")
+
+    return get_limit_setting, set_limit_setting
 
 
 def digest(text: str) -> str:
@@ -165,13 +182,6 @@ def snapshot_message(source: str, state: Any, limit: int | None) -> dict[str, An
     return {"source_sha256": digest(source), "replacements": replacements}
 
 
-class BufferRenderPlanInitializer(RenderPlanInitializer):
-    """Supported singleton override ensuring the ``user`` render channel exists."""
-
-    def __init__(self) -> None:
-        super().__init__(("model", USER_CHANNEL))
-
-
 class BufferSnapshotRecorder(SafeRenderMetadataRecorder):
     reads = {"entries"}
     optional_reads = {"buffer_manager"}
@@ -235,12 +245,17 @@ class BufferExpansionRenderer(RenderTransformRegistrar):
             entry.append_render_transform(USER_CHANNEL, expand, name=PLUGIN)
 
 
+class _SkillRuntime:
+    def __init__(self, registered_registry_id: int | None = None) -> None:
+        self.registered_registry_id = registered_registry_id
+
+
 class BufferExpansionSkill(RenderTransformRegistrar):
+    handles = (SessionStarted, SessionRestored, RenderRequested)
     optional_reads = {"skill_registry"}
     writes = {"skill_registry"}
 
     def __init__(self, skill_path: Path | None = None) -> None:
-        self.registry: Any = None
         self.skill_path = skill_path or resource_path("skills/buffer-expansion/SKILL.md")
         try:
             self.skill_text: str | None = self.skill_path.read_text(encoding="utf-8")
@@ -250,27 +265,41 @@ class BufferExpansionSkill(RenderTransformRegistrar):
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         del event, emit
         registry = getattr(state, "skill_registry", None)
-        if registry is not None and registry is not self.registry:
-            source = SkillSource(
-                path=str(self.skill_path.parent),
-                kind=PLUGIN,
-                scope="bundled",
-                precedence=-5000,
-                native=True,
-                always_list=True,
+        if registry is None:
+            return
+        runtime_fn = getattr(state, "runtime", None)
+        rt = runtime_fn("buffer_expansion_skill", _SkillRuntime) if callable(runtime_fn) else None
+        reg_id = id(registry)
+        if rt is not None and rt.registered_registry_id == reg_id:
+            return
+        source = SkillSource(
+            path=str(self.skill_path.parent),
+            kind=PLUGIN,
+            scope="bundled",
+            precedence=-5000,
+            native=True,
+            always_list=True,
+        )
+        registry.add_sources((source,))
+        if self.skill_text is not None:
+            registry.register_skill_text(
+                str(self.skill_path),
+                self.skill_text,
+                source=source,
             )
-            registry.add_sources((source,))
-            if self.skill_text is not None:
-                registry.register_skill_text(
-                    str(self.skill_path),
-                    self.skill_text,
-                    source=source,
-                )
-            self.registry = registry
+        if rt is not None:
+            rt.registered_registry_id = reg_id
 
 
 def register_features(builder: Any, *, session: Any, config: Any) -> None:
     del session, config
+    box = _load_settings_box()
+    get_limit, set_limit = _make_limit_callbacks(box)
+    initial_limit = (
+        box.settings.get("max_characters", DEFAULT_MAX_CHARACTERS)
+        if box.settings is not None
+        else DEFAULT_MAX_CHARACTERS
+    )
     builder.add(
         Feature(
             name=PLUGIN + "-settings",
@@ -279,8 +308,8 @@ def register_features(builder: Any, *, session: Any, config: Any) -> None:
                     "buffer_expansion.max_characters",
                     "Character limit",
                     "int",
-                    get_limit_setting,
-                    set_limit_setting,
+                    get_limit,
+                    set_limit,
                     group="Buffer expansion",
                     min=0,
                     max=2**63 - 1,
@@ -298,14 +327,12 @@ def register_features(builder: Any, *, session: Any, config: Any) -> None:
         Feature(
             name=PLUGIN,
             components=[
-                BufferRenderPlanInitializer(),
-                BufferSnapshotRecorder(load_limit()),
+                BufferSnapshotRecorder(initial_limit),
                 BufferExpansionRenderer(),
                 BufferExpansionSkill(),
             ],
             order=[
                 BufferSnapshotRecorder,
-                BufferRenderPlanInitializer,
                 BufferExpansionRenderer,
                 BufferExpansionSkill,
                 SystemPromptSkillList,
