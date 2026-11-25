@@ -26,7 +26,7 @@ def _flush_store_updates(session, state_root) -> list[StoreUpdate]:
         if isinstance(eff.request, StoreUpdate)
     ]
     for req in reqs:
-        driver._execute(req)
+        driver.execute(req)
     return reqs
 
 
