@@ -27,7 +27,7 @@ def build(monkeypatch, *, native=False):
         include_llm_drivers=False,
     )
     if not native:
-        plugin.register_features(builder, session=session, config=config)
+        plugin.register_features(builder, config=config)
     pipeline = builder.build()
     session.pipeline = pipeline
     session.ensure_initialized()

@@ -16,10 +16,10 @@ from agent_utils.features.core import (
     SafeRenderMetadataRecorder,
 )
 from agent_utils.features.skills import SkillSource
+from agent_zoo.core.render_channels import USER_RENDER_CHANNEL
 from agent_zoo.durability import PluginStorage, StoreUpdate
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.system_prompt import SystemPromptSkillList
-from agent_zoo.transport.render_channels import USER_RENDER_CHANNEL
 
 PLUGIN = "azo-plugin-buffer-expansion"
 METADATA_KEY = "azo_plugin_buffer_expansion_v1"
@@ -291,8 +291,8 @@ class BufferExpansionSkill(RenderTransformRegistrar):
             rt.registered_registry_id = reg_id
 
 
-def register_features(builder: Any, *, session: Any, config: Any) -> None:
-    del session, config
+def register_features(builder: Any, *, config: Any) -> None:
+    del config
     box = _load_settings_box()
     get_limit, set_limit = _make_limit_callbacks(box)
     initial_limit = (
